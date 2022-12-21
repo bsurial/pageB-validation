@@ -1,0 +1,1590 @@
+---
+title: "Page-B in HIV/HBV coinfection - Left-Truncation Analysis"
+description: |
+  This is a multi-cohort validation study of the PAGE-B score in HIV/HBV coinfected patients.
+author:
+  - name: Bernard Surial
+    orcid_id: 0000-0002-1402-974X
+    affiliation: Deparment of Infectious Diseases, Inselspital Bern
+    affiliation_url: http://www.infektiologie.insel.ch/
+  - name: Gilles Wandeler
+    orcid_id: 0000-0002-5278-8763
+    affiliation: Deparment of Infectious Diseases, Inselspital Bern
+    affiliation_url: http://www.infektiologie.insel.ch/
+date: "`r Sys.Date()`"
+output: 
+  distill::distill_article:
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    theme: flatly
+  bookdown::word_document2:
+    number_sections: false
+    reference_docx: template.docx
+params:
+  impute: FALSE
+  n_imputations: 50
+bibliography: references.bib
+csl: clinical-infectious-diseases.csl
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  comment = "##",
+  R.options = list(width = 60), 
+  fig.path = "graphs/",
+  dpi = 300,
+  out.width = "75%"
+)
+```
+
+```{r packages, include=FALSE}
+library(data.table)
+library(survival)
+library(survminer)
+library(broom)
+library(rms)
+library(here)
+library(lubridate)
+library(mice)
+library(glue)
+library(tableone)
+library(flextable)
+library(gt)
+library(paletteer)
+library(gtsummary)
+library(patchwork)
+library(tidyverse)
+
+
+source(here("func.R"))
+mcomma <- scales::comma
+```
+
+```{r themes}
+
+# Set GT Summary Theme
+my_theme <-
+  list(
+    "tbl_summary-str:default_con_type" = "continuous",
+    "tbl_summary-str:continuous_stat" = "{median} ({p25} to {p75})",
+    "style_number-arg:big.mark" = "",
+    "tbl_summary-arg:missing_text" = "(Missing)"
+  )
+
+set_gtsummary_theme(my_theme)
+
+
+# Set Flextable Theme
+big_border = officer::fp_border(color="black", width = 0.5)
+theme_ft_surial <- function(x) {
+  x %>% 
+    border_remove() %>% 
+    hline_bottom(part = "header", border = big_border) %>%
+    hline_bottom(part = "body", border = big_border) %>%
+    bold(part = "header") %>% 
+    font(fontname = "Tahoma", part = "all") %>% 
+    fontsize(size = 9, part = "all") %>% 
+    padding(padding.top = 2, padding.bottom = 2) %>% 
+    autofit() 
+}
+
+# For Kaplan Meier Curves
+theme_kaplan <- function(..., base_size = 12, base_family = "Roboto") {
+  survminer::theme_survminer(
+    base_family = base_family, base_size = base_size) +
+  theme(axis.line = element_line(color = "grey60"), 
+        axis.ticks = element_line(color = "grey60"), 
+        axis.text.x = element_text(margin = margin(t = 2, unit ="mm")),
+        axis.text.y = element_text(margin = margin(r = 2, unit ="mm")), 
+        axis.title.x = element_text(margin = margin(t = 4, unit = "mm")),
+        axis.title.y = element_text(margin = margin(r = 4, unit = "mm")), 
+        legend.position = c(0.3, 0.8), 
+        panel.grid.major.y = element_line(color = "grey95", size = 0.5),
+        ...
+  )
+}
+```
+
+```{r read-data, include = FALSE}
+# Read combined dataset
+full <- read_rds(here("processed", "07-cohorts_combined.rds"))
+```
+
+```{r wrangle-data-baseline_d}
+# Modify dataset
+
+# Add regdate for sensitivity analysis
+# EUROSIDA
+es_regdate <- raw_read_eu("tblBAS") %>% 
+  select(p_id = patient, cohort_baseline) %>% 
+  mutate(regdate = ymd(cohort_baseline), # 39 failed to parse
+         p_id = as.character(p_id)) %>% 
+  select(-cohort_baseline)
+
+# ATHENA
+ath_regdate <- raw_read_ath("tblbas") %>% 
+  select(regdate = enrol_d, p_id = projectid) %>% 
+  mutate(p_id = as.character(p_id))
+
+
+# SHCS
+sh_regdate <- pro_read_sh("pat.rds") %>% 
+  select(p_id = id, regdate) %>% 
+  mutate(p_id = as.character(p_id))
+
+
+# Aquitaine
+aq_regdate <- raw_read_aqui("tblbas") %>% 
+  select(p_id = patient, regdate = enrol_d) %>% 
+  mutate(p_id = as.character(p_id))
+
+# Combine all together
+all_regdate <- bind_rows(es_regdate, ath_regdate, sh_regdate, aq_regdate)
+full <- full %>% 
+  left_join(all_regdate)
+
+
+# Generate baseline_d, which is tfv_sd for those who started TFV after 
+# cohort registration, and reg_date for those who started TFV before. 
+# Note: I don't adjust all other BL-variables because I don't need them for the
+# prediction model. 
+
+full <- full %>% 
+  mutate(apri_above_2 = apri_baseline > 2) %>% 
+  
+  # SENSITIVITY: We want to examine what happens if we take registration date
+  # as baseline in individuals who started TFV before enrolling in the cohort
+  mutate(baseline_d = case_when(tfv_sd >= regdate ~ tfv_sd, 
+                                tfv_sd < regdate ~ regdate))
+```
+
+
+```{r wrangle-data-add-plt_2}
+# Add plt_c = platelet value at baseline_d
+# PLT ATHENA
+plt_athena <- raw_read_ath("tbllab") %>% 
+  mutate(lab_unit = factor(lab_u, 
+                           labels = c(
+                             "mmol/L",
+                             "g/L",
+                             "IU/L",
+                             "µmol/L", 
+                             "INR",
+                             "1E+9/L",
+                             "1E+6/L",
+                             "cells/mcL",
+                             "%",
+                             "µg/L",
+                             "fl",
+                             "mg/L",
+                             "no_unit"))) %>% 
+  select(projectid, item = lab_id, 
+         lab_d, value = lab_v, 
+         unit = lab_unit, specimen = lab_st) %>% 
+  filter(item == "THR") %>% 
+  select(p_id = projectid, 
+         plt = value, 
+         plt_d = lab_d, unit) %>% 
+  # Same adjustments as in Script 03-read_athena_data.R
+  mutate(plt = if_else(plt > 3000 & unit == "no_unit", 
+                       plt / 1000, plt)) %>% 
+  mutate(plt = if_else(plt < 0, NA_real_, plt)) %>% 
+  mutate(p_id = as.character(p_id))
+
+
+
+# PLT Eurosida
+plt_eurosida <- raw_read_eu("tblLAB") %>% 
+  filter(!is.na(lab_v)) %>% 
+  mutate(lab_v = comma_parser(lab_v)) %>% 
+  select(patient, item = lab_id, 
+         lab_d, value = lab_v, 
+         unit = lab_u, specimen = lab_st)%>%
+  filter(item == "THR") %>%
+  select(p_id = patient,
+         plt = value,
+         plt_d = lab_d, unit) %>% 
+  # Same adjustments as in Script 04-read_eurosida_data.R
+  mutate(plt = if_else(plt > 3000, 
+                       plt / 1000, plt)) %>% 
+  mutate(plt = if_else(plt < 0, NA_real_, plt)) %>% 
+  mutate(p_id = as.character(p_id))
+
+
+# PLT Aquitaine
+plt_aquitaine <- raw_read_aqui("tbllab") %>% 
+  mutate(lab_unit = factor(lab_u, 
+                           labels = c(
+                             "mmol/L",
+                             "g/L",
+                             "g/dL",
+                             "IU/L",
+                             "µmol/L", 
+                             "1E+9/L",
+                             "cells/µL",
+                             "%",
+                             "µg/L",
+                             "no_unit"))) %>% 
+  select(patient, item = lab_id, 
+         lab_d, value = lab_v, 
+         unit = lab_unit, specimen = lab_st) %>% 
+  filter(item == "THR") %>% 
+  select(p_id = patient, 
+         plt = value, 
+         plt_d = lab_d, unit) %>% 
+  # No adjustments, as in 05-read_aquitaine_data.R
+  mutate(p_id = as.character(p_id))
+
+
+# SHCS Platelets
+plt_shcs <- pro_read_sh("lab.rds") %>% select(id, pla, labdate) %>% 
+  select(p_id = id, plt = pla, plt_d = labdate) %>% 
+  mutate(unit = NA_complex_) %>% 
+  filter(!is.na(plt)) %>% 
+  mutate(p_id = as.character(p_id))
+
+
+
+
+# Connect them step by step
+
+# 1. generate baseline_d
+d <- full %>% 
+  mutate(apri_above_2 = apri_baseline > 2) %>% 
+  
+  # SENSITIVITY: We want to examine what happens if we take registration date
+  # as baseline in individuals who started TFV before enrolling in the cohort
+  mutate(baseline_d = case_when(tfv_sd >= regdate ~ tfv_sd, 
+                                tfv_sd < regdate ~ regdate))
+
+
+# 2. subset cohort and specific window
+
+d %>% 
+  count(cohort)
+
+# SHCS (window +/- 180) # n = 520
+shcs_d <- d %>% 
+  mutate(LB = baseline_d - 180,
+         UB = baseline_d + 180) %>% 
+  filter(cohort == "SHCS") %>% 
+  select(p_id, baseline_d, LB, UB)
+
+# ATHENA (window +/- 180) # n = 1323
+athena_d <- d %>% 
+  mutate(LB = baseline_d - 180,
+         UB = baseline_d + 180) %>% 
+  filter(cohort == "ATHENA") %>% 
+  select(p_id, baseline_d, LB, UB)
+
+# Aquitaine (window +/- 180) # n = 339
+aquitaine_d <- d %>% 
+  mutate(LB = baseline_d - 180,
+         UB = baseline_d + 180) %>% 
+  filter(cohort == "Aquitaine") %>% 
+  select(p_id, c_id, baseline_d, LB, UB)
+
+
+# Eurosida (window -365, +180) # n = 806
+eurosida_d <- d %>% 
+  mutate(LB = baseline_d - 365,
+         UB = baseline_d + 180) %>% 
+  filter(cohort == "Eurosida") %>% 
+  select(p_id, baseline_d, LB, UB)
+
+
+# 3. Join them with platelets
+
+# SHCS
+setDT(plt_shcs); setDT(shcs_d)
+
+# Non-equi join
+plt_shcs <- plt_shcs[shcs_d,
+           # variables to join on:
+           on = .(p_id, plt_d >= LB, plt_d <= UB),
+           # variables (renamed) to keep in data.frame
+           .(p_id, baseline_d = i.baseline_d, plt_d = x.plt_d, plt = x.plt)] %>%
+  as_tibble() %>%
+  # Only take closest measurement to baseline if there are more than 1
+  arrange(p_id, baseline_d, abs(baseline_d - plt_d)) %>%
+  group_by(p_id) %>%
+  slice(1) %>%
+  ungroup()
+
+
+# ATHENA
+setDT(plt_athena); setDT(athena_d)
+
+# Non-equi join
+plt_athena <- plt_athena[athena_d,
+                         # variables to join on:
+                         on = .(p_id, plt_d >= LB, plt_d <= UB),
+                         # variables (renamed) to keep in data.frame
+                         .(p_id, baseline_d = i.baseline_d, plt_d = x.plt_d, plt = x.plt)] %>%
+  as_tibble() %>%
+  # Only take closest measurement to baseline if there are more than 1
+  arrange(p_id, baseline_d, abs(baseline_d - plt_d)) %>%
+  group_by(p_id) %>%
+  slice(1) %>%
+  ungroup()
+
+
+# Eurosida
+setDT(plt_eurosida); setDT(eurosida_d)
+
+# Non-equi join
+plt_eurosida <- plt_eurosida[eurosida_d,
+                             # variables to join on:
+                             on = .(p_id, plt_d >= LB, plt_d <= UB),
+                             # variables (renamed) to keep in data.frame
+                             .(p_id, baseline_d = i.baseline_d, plt_d = x.plt_d, plt = x.plt)] %>%
+  as_tibble() %>%
+  # Only take closest measurement to baseline if there are more than 1
+  arrange(p_id, baseline_d, abs(baseline_d - plt_d)) %>%
+  group_by(p_id) %>%
+  slice(1) %>%
+  ungroup()
+
+
+# Aquitaine
+setDT(plt_aquitaine); setDT(aquitaine_d)
+
+# Non-equi join
+plt_aquitaine <- plt_aquitaine[aquitaine_d,
+                               # variables to join on:
+                               on = .(p_id, plt_d >= LB, plt_d <= UB),
+                               # variables (renamed) to keep in data.frame
+                               .(p_id, baseline_d = i.baseline_d, plt_d = x.plt_d, plt = x.plt)] %>%
+  as_tibble() %>%
+  # Only take closest measurement to baseline if there are more than 1
+  arrange(p_id, baseline_d, abs(baseline_d - plt_d)) %>%
+  group_by(p_id) %>%
+  slice(1) %>%
+  ungroup()
+
+
+
+# 4. Combine Platelet datasets (plt_2 means left-censored plt value)
+
+plt_2 <- bind_rows(plt_aquitaine, plt_athena, plt_eurosida, plt_shcs) %>% 
+  select(p_id, plt_2 = plt)
+
+
+full <- full %>% 
+  left_join(plt_2, by = "p_id") %>% 
+  select(c_id:plt_d, plt_2, everything())
+```
+
+
+```{r wrangle-data}
+# I will look at events within 5 years as Papatheodoridis (time_y, event), and
+# within the full follow-up period - censored at 15 years (time_y2, event2)
+
+time_dat <- full %>% 
+  # Variables as defined by Papatheodoridis
+  mutate(age = year(tfv_sd) - birth_d, 
+         male = if_else(gender == "male", 1, 0), 
+         
+         # Now I use plt_2 instead (new baseline-PLT)
+         plt_c = case_when(plt_2 >= 200 ~ "200+", 
+                           plt_2 >= 100 & plt_2 < 200 ~ "100-199", 
+                           plt_2 < 100 ~ "<100"), 
+         plt_c = factor(plt_c, levels = c("200+", "100-199", "<100")), 
+         
+         # Left_truncation
+         left_c = tfv_sd < regdate, 
+         time0 = if_else(left_c == FALSE, 0, 
+                         as.numeric(regdate - tfv_sd)/365.25)) %>% 
+  # Now calculate fup
+  mutate(delta_hcc = as.numeric(hcc_d - tfv_sd) / 365.25, 
+         delta_fup = as.numeric(last_fup_d - tfv_sd) / 365.25) %>% 
+  # Events within 5 years
+  mutate(time_y = case_when(!is.na(hcc_d) & delta_hcc < 5 ~ delta_hcc, 
+                            !is.na(hcc_d) & delta_hcc >= 5 ~ 5,
+                            is.na(hcc_d) & delta_fup < 5 ~ delta_fup,
+                            is.na(hcc_d) & delta_fup >= 5 ~ 5),
+         event = if_else(!is.na(hcc_d) & delta_hcc < 5, 1, 0)) %>% 
+  # Events within 15 years (censored to give them later not too much weight, 
+  # as suggested by Andi and Marie, 28.1.22)
+  mutate(time_y2 = case_when(!is.na(hcc_d) & delta_hcc < 15 ~ delta_hcc, 
+                             !is.na(hcc_d) & delta_hcc >= 15 ~ 15,
+                             is.na(hcc_d) & delta_fup < 15 ~ delta_fup,
+                             is.na(hcc_d) & delta_fup >= 15 ~ 15),
+         event2 = if_else(!is.na(hcc_d) & delta_hcc < 15, 1, 0)) %>% 
+  # Calculate linear predictor based on coefficients in the Page-B paper
+  mutate(LP = 1.4901 * male + 0.0527 * age + 1.5744 * (plt_c == "100-199") + 2.3258 * (plt_c == "<100"))
+```
+
+# Results
+
+```{r get-numbers}
+# Get some numbers to print later in text.
+hcc_prior_tfv <- time_dat %>% 
+  filter(time_y2 <= 0 & hcc == TRUE) %>% nrow()
+
+no_fup <- time_dat %>% 
+  filter(time_y2 <= 0 & hcc != TRUE) %>% 
+  nrow()
+
+no_info_on_fup <- time_dat %>% 
+  filter(is.na(time_y)) %>% 
+  nrow()
+
+# Remove those individuals with HCC before TFV and those without follow-up after BL
+time_sub <- time_dat %>% 
+  filter(time_y2 > 0) 
+
+n_study <- nrow(time_sub) # 2963 in sensitivity analysis. 
+```
+
+```{r follow-up}
+m_iqr <- function(x, accuracy = 0.1) {
+  iqr_l = quantile(x, 0.25) 
+  iqr_h = quantile(x, 0.75)
+  glue("{mcomma(iqr_l, accuracy)} to {mcomma(iqr_h, accuracy)}")
+}
+
+
+# Follow-up
+fup <- time_sub %>% 
+  summarise(median_fup = mcomma(median(time_y2), 0.1), 
+            iqr_fup = m_iqr(time_y2))
+```
+
+
+## SENSITIVITY ANALYSIS
+
+This analysis is done after input from Andi. There are a few patients 
+how enter the cohort (regdate) after TFV start. As we are not sure how well
+HCC diagnosis before regdate were registered. Time-to-event is always counted 
+from TFV start, but fup only starts to count at regdate. This is accomplished 
+with `Surv(time = tfv_sd or regdate, time2 = event_d - tfv_sd for all)`. 
+
+However, I wouldn't use this analysis as the "Main" one because there are at
+least 4 patients who developed HCC date before cohort entry (3 in Eurosida) and
+we have data on them. So excluding them seems wrong to me. 
+
+## Study Population
+
+Data from `r length(unique(time_dat$cohort))` cohorts were included:
+`r glue_collapse(unique(time_dat$cohort), ", ", last = " and ")`. Of
+`r nrow(full)` eligible patients with the last HBsAg prior to tenofovir
+(TFV) start being positive, we excluded `r hcc_prior_tfv` patients who
+developed HCC before starting TFV, and `r no_fup + no_info_on_fup`
+patients without available follow-up data after TFV start, resulting in
+`r nrow(time_sub)` patients being included. Patient characteristics are
+presented in **Table** \@ref(tab:tab1).
+
+<br>
+
+```{r table-1, tab.cap = '(ref:tab1)', tab.id = "tab1", label = "tab1", tab.cap.style = "Table Caption", ft.align = "center"}
+vars <- c("male", "age", "caucasian", "origin_cat", "transmission_risk",
+          "prior_xtc", 
+          "prior_xtc_years", "plt_2", "plt_c", "hbe_baseline", "any_hdv", 
+          "cd4_baseline", "bmi_baseline", "co_dia", "hcv_coinfection", 
+          "apri_above_2", "cirrhosis", "alt_baseline", "time_y2")
+
+
+ft <- time_sub %>% 
+  select(cohort, one_of(vars)) %>% 
+  droplevels() %>%  
+  mutate(across(c(male, caucasian, transmission_risk, prior_xtc,
+                  plt_c, hbe_baseline, any_hdv, co_dia, hcv_coinfection,
+                  apri_above_2, cirrhosis),
+                ~factor(.x) %>% fct_explicit_na(na_level = "(Missing)"))) %>% 
+  tbl_summary(by = cohort,  
+              label = list(male ~ "Male sex",
+                           age ~ "Age in years (IQR)", 
+                           caucasian ~ "Caucasian", 
+                           origin_cat ~ "Region of Origin",
+                           transmission_risk ~ "Transmission Group",
+                           prior_xtc ~ "XTC use before TFV", 
+                           prior_xtc_years ~ "Prior XTC use in years (IQR)", 
+                           plt_2 ~ "Platelets in 10^3 (IQR)", 
+                           plt_c ~ "Platelets (10^3)",
+                           hbe_baseline ~ "HBeAg positive", 
+                           any_hdv ~ "HDV coinfection", 
+                           cd4_baseline ~ "CD4 count in cells/µL (IQR)", 
+                           bmi_baseline ~ "BMI in kg/m2 (IQR)", 
+                           co_dia ~ "Diabetes", 
+                           hcv_coinfection ~ "HCV coinfection", 
+                           apri_above_2 ~ "APRI > 2", 
+                           cirrhosis ~ "Liver cirrhosis",
+                           alt_baseline ~ "ALT at baseline in IU/L (IQR)", 
+                           time_y2 ~ "Follow-up in years (IQR)"),
+              type = all_continuous() ~ "continuous2",
+              missing = "no",
+              statistic = all_continuous() ~ c("{median} ({p25}, {p75})",
+                                               "{N_miss} ({p_miss}%)")) %>% 
+  add_overall() %>% 
+  modify_table_body(mutate,
+                    label = ifelse(label == "N missing (% missing)",
+                   "Unknown", label)) %>% 
+                bold_labels() %>%
+                as_flex_table() %>% 
+  theme_ft_surial()
+
+# Make width of table max size of a4 page
+ft_names <- dim(ft)$widths %>% names() # names from the table
+
+first_col <- dim_pretty(ft)$widths[1] # first row is "pretty"
+
+# Rest will be evenly spaced
+other_cols <- (6.3 - first_col)/ length(dim_pretty(ft)$widths[-1])
+
+ft %>% 
+  width(j = as.formula(glue("~{ft_names[1]}")), 
+        width = first_col) %>% 
+  width(j = as.formula(paste0("~",glue_collapse(ft_names[-1], sep = " + "))), 
+        width = other_cols)
+```
+
+<br>
+
+## Incidence of hepatocellular carcinoma
+
+```{r hcc-incidence}
+fit <- survfit(Surv(time = time0, time2 = time_y2, event2) ~ 1, data = time_sub)
+estimate <- summary(fit, times = c(1, 3, 5, 10), fun = "event")
+
+# Cumulative probability of HCC within 5 years in our study (%)
+cum_prob <- paste0(mcomma(estimate$cumhaz * 100, 0.01), "%")
+
+# Function for the number of HCCs
+n_hcc <- function(cohort = NULL) {
+  if(is.null(cohort)) {
+    sum(time_sub$event2) %>% 
+      bernr::n_pct(total = n_study)
+  } else {
+    sum(time_sub$hcc[time_sub$cohort == cohort]) %>% 
+      bernr::n_pct(sum(time_sub$event2))
+  }
+}
+```
+
+Within a median follow-up of `r fup$median_fup` (IQR `r fup$iqr_fup`)
+years, hepatocellular carcinoma (HCC) was diagnosed in `r n_hcc()`
+indivdiduals. Of those `r n_hcc("ATHENA")` developed in the ATHENA
+cohort, `r n_hcc("Eurosida")` in Eurosida, `r n_hcc("Aquitaine")` in
+Aquitaine, and `r n_hcc("SHCS")` in the SHCS. The cumulative 1-, 3-, 5-
+and 10-year rates of HCC were
+`r glue_collapse(cum_prob, ", ", last = " and ")`, respectively. Within
+5 years of follow-up (*period used for PAGE-B score derivation*),
+`r bernr::n_pct(sum(time_sub$event), n_study)` individuals developed
+HCC.
+
+<br>
+
+```{r}
+time_sub %>% 
+  select(time_y2, event2, cohort) %>% 
+  summarise(years = sum(time_y2), 
+            events = sum(event2)) %>% 
+  mutate(incidence = events / years * 1000) %>% 
+  knitr::kable()
+
+m <- glm(event2 ~ 1 + offset(log(time_y2)), data = time_sub, 
+    family = poisson(link = "log"))
+
+m_pred <- predict(m, newdata = tibble(time_y2 = 1), se.fit = TRUE)
+
+incidence <- c(est = m_pred$fit, 
+               lci = m_pred$fit - 1.96 * m_pred$se.fit, 
+               hci = m_pred$fit + 1.96 * m_pred$se.fit) %>% 
+  exp()
+
+scales::comma(incidence * 1000, accuracy = 0.01) %>% 
+  knitr::kable(caption = "Incidence rate over full period")
+
+
+
+
+time_sub %>% 
+  select(time_y, event, cohort) %>% 
+  summarise(years = sum(time_y), 
+            events = sum(event)) %>% 
+  mutate(incidence = events / years * 1000) %>% 
+  knitr::kable()
+
+m <- glm(event ~ 1 + offset(log(time_y)), data = time_sub, 
+    family = poisson(link = "log"))
+
+m_pred <- predict(m, newdata = tibble(time_y = 1), se.fit = TRUE)
+
+incidence <- c(est = m_pred$fit, 
+               lci = m_pred$fit - 1.96 * m_pred$se.fit, 
+               hci = m_pred$fit + 1.96 * m_pred$se.fit) %>% 
+  exp()
+
+scales::comma(incidence * 1000, accuracy = 0.01) %>% 
+  knitr::kable(caption = "Incidence rate over 5 years")
+
+```
+
+
+## Score validation
+
+### Complete case score validation within 15 years
+
+We aim to externally validate the Page-B score [@Papatheodoridis2016a],
+which identifies individuals at risk for the development of HCC within 5
+years. In addition, a follow-up article showed that the score did also
+perform well for HCC development in years 5-12 @Papatheodoridis2020c.
+For the model validation, I followed the steps outlined by Royston et
+al. [@Royston2013] in their nice article elaborating on external
+validation of Cox models.
+
+<br>
+
+##### Step 1: Regressing the linear predictor only
+
+```{r complete-5y-step1}
+# Step 1 from Royston and Altman
+S <- Surv(event = time_sub$event2, time = time_sub$time0, time2 = time_sub$time_y2)
+
+
+m_noimp <- coxph(S ~ LP, data = time_sub)
+estimate <- m_noimp %>% 
+  tidy(conf.int = TRUE)
+
+# I add the offset(LP) to test the hypothesis that LP == 1 (not 0 as above)
+m_noimp2 <- coxph(S ~ LP + offset(LP), data = time_sub)
+
+estimate$p.value <- m_noimp2 %>% 
+  tidy() %>% 
+  pull(p.value)
+
+estimate <- estimate %>% 
+  mutate(across(c(estimate, std.error), mcomma, 0.01),
+         p.value = style_pvalue(p.value, 2))
+
+c <- m_noimp$concordance["concordance"]
+c.std <- m_noimp$concordance["std"]
+
+# # We can also calculate the C'index using Harrells rcorr.cens
+# rcorr.cens(-1 * time_sub$LP, S)[1]
+# 
+# # Gonen and Heller K (AUC for survival models)
+# survAUC::GHCI(na.omit(time_sub$LP)) # Omit NA's
+
+# Calculate R2D (explained variation)
+# d <- rcorr.cens(-1 * time_sub$LP, S)[2]
+# d2k2 <- (d^2) / (1.596^2)
+# d2k2 / 1.645 + d2k2
+
+
+c.ci <- mcomma(c(c - 1.96 * c.std, c + 1.96 * c.std), 0.01)
+
+cdf <- tibble(term = "Harrell c-index", estimate = as.numeric(c), 
+              std.error = as.numeric(c.std), CI = glue_collapse(c.ci, " to "), 
+              p.value = NA) %>% 
+  mutate(across(c(estimate, std.error), mcomma, 0.01))
+
+comp_result <- bind_rows(estimate, cdf) %>% 
+  mutate(CI = if_else(is.na(CI), 
+                      glue("{mcomma(conf.low, 0.01)} to {mcomma(conf.high, 0.01)}"), 
+                      CI))
+```
+
+The slope for the linear predictor is `r estimate$estimate` (SE
+`r estimate$std.error`). The slope is similar to 1, which indicates
+preserved prediction with a p-value that is not significant (*P* =
+`r estimate$p.value`).
+
+<br>
+
+##### Step 2: Including the covariates as offset
+
+In the next step, we add the covariates used in the PAGE-B score (age,
+gender and platelet category) as predictors, including the linear
+predictor as offset.
+
+```{r complete-5y-step2a}
+# Step 2
+m_noimp2 <- coxph(S ~ male + age + plt_c + offset(LP), data = time_sub)
+
+# P-value for joint test is significantly different from 0
+a.p <- style_pvalue(glance(m_noimp2)$p.value.log)
+```
+
+The joint test for all regression coefficients being 0 is `r a.p`.
+**Table** \@ref(tab:step2comp) below shows all regression coefficients.
+We see that male sex is much below 0, which means that male sex seems
+not as much a risk factor as in the original paper, which is consistent
+with the findings in Wandeler et al[@Wandeler2019]. Also, there seems to
+be some inconsistency with platelets 100 - 199.
+
+<br>
+
+```{r complete-5y-step2b, tab.cap = '(ref:step2comp)', tab.id = "step2comp", label = "step2comp", tab.cap.style = "Table Caption", ft.align = "center"}
+# Coefficients for "male" and "plt_c = 100-199" seem problematic here 
+m_noimp2 %>% 
+  tbl_regression(label = list(male ~ "Male sex", 
+                              age ~ "Age", 
+                              plt_c ~ "Platelet category")) %>% 
+  bold_labels() %>%
+  as_flex_table() %>% 
+  theme_ft_surial()
+
+comp_result <- comp_result %>% 
+  bind_rows(
+    m_noimp2 %>% 
+      tidy() %>% 
+      mutate(across(c(estimate, std.error), mcomma, 0.01)) %>% 
+      mutate(p.value = style_pvalue(p.value, 2)))
+```
+
+<br>
+
+##### Step 3: Calculating the *c-statistic*
+
+The *c-statistic* is derived from the model with the linear predictor
+only (**step 1**), and was `r mcomma(c, 0.01)` (95% CI
+`r glue("{c.ci[1]} to {c.ci[2]}")`).
+
+<br>
+
+##### Step 4: Inspecting Kaplan Meier curves of Risk groups
+
+As we can see in the Kaplan Meier curve (**Figure**
+\@ref(fig:complete-5y-step3)), the PAGE-B score seems to identify
+high-risk individuals (PAGE-B ≥18), but lines of the other 2 groups
+largely overlap.
+
+<br>
+
+```{r complete-5y-step3, fig.cap='(ref:kaplan5ycomplete)'}
+# Step 3 Kaplan meier curves
+
+# Calculate Page B score
+time_sub <- time_sub %>% 
+    mutate(age_points = case_when(between(age, 16, 29) ~ 0, 
+                                between(age, 30, 39) ~ 2,
+                                between(age, 40, 49) ~ 4,
+                                between(age, 50, 59) ~ 6, 
+                                between(age, 60, 69) ~ 8, 
+                                age >= 70 ~ 10), 
+         gender_points = if_else(gender == "male", 6, 0), 
+         plt_points = case_when(plt_c == "200+" ~ 0, 
+                                plt_c == "100-199" ~ 6, 
+                                plt_c == "<100" ~ 9), 
+         page_b = age_points + gender_points + plt_points, 
+         page_b_cat = case_when(page_b <= 9 ~ "Score ≤9",
+                                between(page_b, 10, 17) ~ "Score 10-17", 
+                                page_b >= 18 ~ "Score ≥18"), 
+         page_b_cat = factor(page_b_cat, levels = c("Score ≤9", 
+                                                    "Score 10-17", 
+                                                    "Score ≥18"))) %>% 
+  select(-(age_points:plt_points))
+
+
+
+S_kaplan <- survfit(Surv(time = time0, time2 = time_y, event = event) ~ page_b_cat, time_sub) 
+
+pp <- ggsurvplot(S_kaplan, 
+                fun = "cumhaz", 
+                conf.int = FALSE, 
+                risk.table = FALSE,  
+                xlab = "Years since TFV start", 
+                ylab = "Cumulative probability of HCC", 
+                legend.labs = c("Page-B ≤ 9", 
+                                "Page-B 10-17",
+                                "Page-B ≥ 18"), 
+                legend.title = "Page-B score", 
+                ylim = c(0, 0.15), 
+                censor = FALSE, 
+                ggtheme = theme_survminer(base_family = "Roboto"))
+
+pp$plot + 
+  theme_kaplan() + 
+  labs(color = NULL) + 
+  scale_color_paletteer_d("colorblindr::OkabeIto")
+
+# # Calculate HR for risk groups
+# coxph(Surv(time_y, event) ~ factor(page_b_cat), data=time_sub) %>% 
+#   tidy(exp = TRUE, conf.int = TRUE)
+```
+
+<br>
+
+For comparison, **Figure** \@ref(fig:km-papa) from the original
+publication [@Papatheodoridis2016a] shows a generally higher incidence
+of HCC over time, with better discrimination using the three groups.
+
+<br>
+
+```{r km-papa, fig.cap='(ref:papa)'}
+knitr::include_graphics(here::here("km-papatheodoridis.png"))
+```
+
+<br>
+
+```{r kaplan-paper-15y}
+# Generate graph for paper, for 15 years
+S_kaplan <- survfit(Surv(time = time0, time2 = time_y2, event = event2) ~ page_b_cat, time_sub) 
+
+pp <- ggsurvplot(S_kaplan, 
+                fun = "cumhaz", 
+                conf.int = FALSE, 
+                risk.table = FALSE,  
+                xlab = "Years since TFV start", 
+                ylab = "Cumulative probability of HCC", 
+                legend.labs = c("Page-B ≤ 9", 
+                                "Page-B 10-17",
+                                "Page-B ≥ 18"), 
+                legend.title = "Page-B score", 
+                ylim = c(0, 0.15), 
+                censor = FALSE, 
+                ggtheme = theme_survminer(base_family = "Roboto"))
+
+kaplan_15y_cc <- pp$plot + 
+  theme_kaplan() + 
+  labs(color = NULL) + 
+  scale_color_paletteer_d("colorblindr::OkabeIto")
+
+kaplan_15y_cc
+
+# ggsave(plot = kaplan_15y_cc, here("graphs", "08b-kaplan-meier_15y_sens.png"), 
+#        dpi = 300, bg = "white", 
+#        width = 6, height = 5)
+```
+
+
+
+### Validation using multiple imputation
+
+As was evident above, many individuals (incl. many events) had to be
+excluded because data on important predictors (especially platelets)
+were missing.
+
+Now lets do the  imputation. 
+
+```{r impute, eval=params$impute}
+# This is the important imputation step. I change plt to plt_2 here.
+sub <- time_sub %>%
+  select(p_id, c_id, plt_2, gender, tfv_sd, cohort, birth_d, caucasian, 
+         height, death,
+         drop, transmission_risk, co_dia, hcv_coinfection, alb_baseline, any_hdv,
+         cd4_baseline, apri_baseline, cirrhosis, cirrhosis_basis,
+         prior_xtc, prior_xtc_years,
+         bil_baseline, hcc, hcc_d, last_fup_d, delta_fup, delta_hcc,
+         event, event2, time0, time_y, time_y2)
+
+# Perform imputations
+set.seed(123)
+# We run the mice code with 0 iterations
+imp <- mice(sub, maxit = 0)
+
+
+# Extract predictorMatrix and methods of imputation
+predM <- imp$predictorMatrix
+meth <- imp$method
+
+# These variables are just "kept in" because I use them later. Don't use
+# them for the imputation process (neither as predictor, nor impute them)
+predM[, c("hcc_d", "last_fup_d", "delta_fup", "delta_hcc", "time0",
+          "time_y", "event", "event2", "cirrhosis_basis")] <- 0
+meth[c("hcc_d", "last_fup_d", "delta_fup", "delta_hcc", "time0",
+       "time_y", "event", "event2", "cirrhosis_basis")] <- ""
+
+
+# Run  imputations to assess quality of imputation
+imp_data <- mice(sub, m = params$n_imputations, method = meth, pred = predM,
+                 seed = 123,
+                 printFlag = FALSE)
+
+write_rds(imp_data, here("processed", "08d-imputed_data_left_trunc.rds"))
+```
+
+```{r read-impute-data, eval=!params$impute}
+imp_data <- read_rds(here("processed", "08d-imputed_data_left_trunc.rds"))
+```
+
+
+The following variables were used for imputation:
+
+```{r parameters-imputation, results='asis'}
+imp_data$predictorMatrix %>%
+  as_tibble(rownames = "variable") %>%
+  filter(variable == "plt_2") %>%
+  pivot_longer(-variable) %>%
+  filter(value == 1) %>%
+  mutate(name = glue("* {name}")) %>%
+  pull(name) %>%
+  glue_collapse(sep = "\ \n")
+```
+
+
+When we look at **Figure** \@ref(fig:densityplot), the imputation seems
+to have worked since the distribution of platelet values (`plt_2`) follows
+a curve that we would expect.
+
+<br>
+
+```{r densityplot, fig.cap='(ref:impute)'}
+# Assess imputation
+png(file = here("graphs", "08d-imputation_density.png"),
+    res = 300, width = 19, height = 16, unit = "cm")
+densityplot(imp_data, data = ~ plt_2 | cohort,
+            xlab=list(label= "Platelets (10^3/L)", fontsize=14),
+            ylab=list(label="Density", fontsize=14))
+dev.off()
+```
+
+Now, we are ready to redo all the steps from above.
+
+<br>
+
+```{r calculate-page-b}
+# Redo all calculations in the imputed datasets. To do so, I need to make a
+# long dataset
+
+# Makes a long dataset
+imp_long <- complete(imp_data, action = "long", include = TRUE)
+
+imp_long <- imp_long %>% 
+  mutate(age = year(tfv_sd) - birth_d, 
+         male = if_else(gender == "male", 1, 0), 
+         # Again, I have to use plt_2 here.
+         plt_c = case_when(plt_2 >= 200 ~ "200+", 
+                           plt_2 >= 100 & plt_2 < 200 ~ "100-199", 
+                           plt_2 < 100 ~ "<100"), 
+         plt_c = factor(plt_c, levels = c("200+", "100-199", "<100"))) %>% 
+  # Calculate Page B score
+  mutate(age_points = case_when(between(age, 16, 29) ~ 0, 
+                                between(age, 30, 39) ~ 2,
+                                between(age, 40, 49) ~ 4,
+                                between(age, 50, 59) ~ 6, 
+                                between(age, 60, 69) ~ 8, 
+                                age >= 70 ~ 10), 
+         gender_points = if_else(gender == "male", 6, 0), 
+         plt_points = case_when(plt_c == "200+" ~ 0, 
+                                plt_c == "100-199" ~ 6, 
+                                plt_c == "<100" ~ 9), 
+         page_b = age_points + gender_points + plt_points, 
+         page_b_cat = case_when(page_b <= 9 ~ "Score ≤9",
+                                between(page_b, 10, 17) ~ "Score 10-17", 
+                                page_b >= 18 ~ "Score ≥18"), 
+         page_b_cat = factor(page_b_cat, levels = c("Score ≤9", 
+                                                    "Score 10-17", 
+                                                    "Score ≥18"))) %>% 
+  select(-(age_points:plt_points)) %>% 
+  # Calculate linear predictor
+  mutate(LP = 1.4901 * male + 0.0527 * age + 1.5744 * (plt_c == "100-199") + 2.3258 * (plt_c == "<100"))
+
+# Make them MIDS again for mice to work properly
+imp_mids <- as.mids(imp_long)
+```
+
+
+```{r}
+imp_long %>% 
+  as_tibble() %>% 
+  filter(.imp == 1) %>% 
+  count(page_b_cat) %>% 
+  rename("Page B after Imputation" = page_b_cat) %>% 
+  mutate(p = n/sum(n) * 100) %>% 
+  knitr::kable(digits = 1)
+
+imp_long %>% 
+  as_tibble() %>% 
+  filter(.imp == 1) %>% 
+  count(hcc, page_b_cat) %>% 
+  filter(hcc == TRUE) %>% 
+  rename("Page B after Imputation" = page_b_cat) %>% 
+  group_by(hcc) %>% 
+  mutate(p = n/sum(n) * 100) %>% 
+  knitr::kable(digits = 1)
+
+
+```
+
+
+##### Step 1: Regressing the linear predictor only
+
+```{r imp-5y-step1}
+# Calculate Models for the occurrence of HCC within 5 years
+
+# Step 1:
+## Get estimate for LP (slope)
+model <- with(imp_mids, coxph(Surv(event = event, time = time0, time2 = time_y) ~ LP))
+pm <- pool(model) %>% summary(conf.int = TRUE)
+
+estimate <- pm
+
+
+# Get p-value for LP == 1. To achieve that, I add an offset of LP, which
+# tests the hypothesis of LP == 1
+# https://stats.stackexchange.com/a/431750/305011
+
+model <- with(imp_mids, coxph(Surv(event = event, time0, time2 = time_y) ~ LP + offset(LP)))
+pm <- pool(model) %>% summary(conf.int = TRUE)
+
+estimate$p.value <- pm$p.value
+
+imp_results1 <- tibble(estimate) %>% rename(c.low = "2.5 %", c.hi = "97.5 %")
+```
+
+The regression slope on the linear predictor is
+`r mcomma(estimate$estimate, 0.01)` (SE
+`r mcomma(estimate$std.error, 0.01)`). The slope is lower than 1 but not
+statistically significant (*P* = `r style_pvalue(estimate$p.value, 2)`),
+which indicates preserved discrimination.
+
+<br>
+
+##### Step 2: Including the covariates as offset
+
+```{r imp-5y-step2a}
+# Step 2: 
+model2 <- with(imp_mids, 
+               coxph(Surv(event = event, time = time0, time2 = time_y) ~ 
+                       male + age + plt_c + offset(LP)))
+
+model3 <- with(imp_mids, 
+               coxph(Surv(event = event, time = time0, time2 = time_y) ~ 1))
+# Joint test of 0
+a <- suppressWarnings(D1(model2, model3))$result
+
+a.p <- style_pvalue(a[4])
+```
+
+The p-value for the joint test that all coefficients are 0 is `r a.p`.
+Looking at individual predictors shows the same problem with `Male sex`
+as before (**Table** \@ref(tab:step2imp)).
+
+<br>
+
+```{r imp-5y-step2b,  tab.cap = '(ref:step2imp)', tab.id = "step2imp", label = "step2imp", tab.cap.style = "Table Caption", ft.align = "center"}
+tab2 <- pool(model2) %>% summary() %>% 
+  as_tibble() %>% 
+  mutate(term = case_when(term == "male" ~ "Male sex", 
+                          term == "age" ~ "Age",
+                          term == "plt_c100-199" ~ "Platelets 100-199", 
+                          term == "plt_c<100" ~ "Platelets <100")) %>% 
+  mutate(c.low = estimate - 1.96 * std.error, 
+         c.hi = estimate + 1.96 * std.error) %>% 
+  mutate(across(c(estimate, std.error, c.low, c.hi), ~mcomma(.x, 0.01)), 
+         p.value = style_pvalue(p.value)) %>% 
+  mutate("95% CI" = glue("{c.low}, {c.hi}")) 
+
+tab2 %>% 
+  select("Characteristic" = term, 
+         "log(HR)" = estimate, 
+         `95% CI`, 
+         "p-value" = p.value) %>% 
+  flextable() %>% 
+  theme_ft_surial() %>% 
+  align(j = c(2:4), align = "center", part = "all")
+
+imp_results1 <- imp_results1 %>% 
+  mutate(across(c(estimate, std.error, c.low, c.hi), ~mcomma(.x, 0.01)), 
+         p.value = style_pvalue(p.value, 2), 
+        CI = glue("{c.low} to {c.hi}")) %>% 
+  bind_rows(tab2 %>% 
+              mutate(CI = glue("{c.low} to {c.hi}"))) %>% 
+  select(-c(c.low, c.hi, `95% CI`))
+```
+
+<br>
+
+##### Step 3: Calculating the *c-statistic*
+
+```{r imp-5y-step2}
+# Extract c.statistics and std for all models
+d <- map_dfr(model$analyses, ~.x$concordance[c("concordance", "std")])
+
+# Pool c.statistics using rubins rules. I used logit transformation for c, but
+# not for std because I had errors
+
+
+hcc_5_years <- d %>% 
+  summarise(median_c = median(concordance), 
+            min_c = min(concordance),
+            max_c = max(concordance)) %>% 
+  mutate_all(mcomma, 0.01) %>% 
+  mutate(term = "Harrell c-index")
+
+# pool <- d %>% 
+#   mutate(var = std^2) %>% 
+#   mutate_all(car::logit) %>% 
+#   summarise(pool = 1/params$n_imputations * (sum(concordance))) %>% 
+#   mutate_all(boot::inv.logit)
+# 
+# se_pool <- d %>% 
+#   mutate(var = std^2, 
+#          delta = (concordance - pull(pool))^2) %>%
+#   summarise(v_w = 1/nrow(.) * (sum(var)), 
+#             v_b = 1/(nrow(.) - 1) * sum(delta)) %>% 
+#   summarise(se_pooled = sqrt(v_w + v_b + (v_b / params$n_imputations)))
+# 
+# hcc_5_years <- tibble(pool, se_pool) %>% 
+#   mutate(conf.low = pool - 1.96 * se_pooled, 
+#          conf.high = pool + 1.96 * se_pooled) %>% 
+#   rename(c_statistic = pool) %>% 
+#   mutate_all(mcomma, 0.001)
+
+imp_results1 <- imp_results1 %>% 
+  bind_rows(
+    hcc_5_years %>% 
+      mutate(term = "Harrell c-index") %>% 
+      mutate(range = glue("{min_c} to {max_c}")) %>% 
+      select(term, estimate = median_c, range))
+```
+
+The pooled *c-statistic* for HCC prediction within 5 years was
+`r hcc_5_years[1]` (range
+`r glue("{hcc_5_years$min_c} to {hcc_5_years$max_c}")`).
+
+<br>
+
+##### Step 4: Inspecting Kaplan Meier curves
+
+Now we inspect the stratified Kaplan Meier curve again (**Figure**
+\@ref(fig:imp-5y-step3)). <br>
+
+```{r imp-5y-step3, fig.cap='(ref:kaplan5yimp)'}
+# Step 4: Kaplan meier Curves
+
+# Plot kaplan meier of imputation 1
+df_kaplan <- imp_long %>% 
+  filter(.imp == 1)
+
+S_kaplan <- survfit(Surv(time = time0, time2 = time_y, 
+                         event = event) ~ page_b_cat, df_kaplan) 
+pp <- ggsurvplot(S_kaplan, 
+                fun = "cumhaz", 
+                conf.int = FALSE, 
+                pval = FALSE, 
+                risk.table = FALSE, 
+                xlab = "Years since TFV start", 
+                ylab = "Cumulative hazard of HCC", 
+                legend.labs = c("Page-B ≤ 9", 
+                                "Page-B 10-17", 
+                                "Page-B ≥ 18"), 
+                legend.title = "Page-B score", 
+                ylim = c(0, 0.15), 
+                censor = FALSE, 
+                ggtheme = theme_survminer(base_family = "Open Sans"))
+
+pp$plot + 
+  theme_kaplan() + 
+  labs(color = NULL) + 
+  scale_color_paletteer_d("colorblindr::OkabeIto")
+
+estimates <- summary(S_kaplan, times = 5)
+est_out <- tibble(strata = estimates$strata, 
+                  cum_haz_pct = 100*estimates$cumhaz) %>% 
+  mutate(across(where(is.numeric), scales::comma, 0.01))
+```
+
+<br>
+
+### Repeating the steps for full follow-up
+
+The same steps were repeated for the full follow-up period.
+
+<br>
+
+##### Step 1
+
+```{r}
+# Calculate Models for the occurrence of HCC within full follow-up
+
+# Step 1:
+model <- with(imp_mids, coxph(Surv(event = event2, 
+                                   time = time0, time2 = time_y2) ~ LP))
+pm <- pool(model) %>% summary(conf.int = TRUE)
+
+estimate <- pm
+
+
+# Get p-value for LP == 1. To achieve that, I add an offset of LP, which
+# tests the hypothesis of LP == 1
+# https://stats.stackexchange.com/a/431750/305011
+
+model <- with(imp_mids, coxph(Surv(event = event2, 
+                                   time = time0, time2 = time_y2) ~ LP + offset(LP)))
+pm <- pool(model) %>% summary()
+
+estimate$p.value <- pm$p.value
+
+imp_results2 <- tibble(estimate) %>% rename(c.low = "2.5 %", 
+                                            c.hi = "97.5 %")
+
+```
+
+The regression slope on the linear predictor is
+`r mcomma(estimate$estimate, 0.01)` (SE
+`r mcomma(estimate$std.error, 0.01)`). The slope is almost 1 (*P* =
+`r style_pvalue(estimate$p.value, 2)`) which indicates good
+discrimination.
+
+<br>
+
+##### Step 2
+
+```{r}
+# Step 2: 
+model2 <- with(imp_mids, 
+               coxph(Surv(event = event2, 
+                          time = time0, time2 = time_y2) ~ male + age + plt_c + offset(LP)))
+
+model3 <- with(imp_mids, 
+               coxph(Surv(event = event2, 
+                          time = time0, time2 = time_y2) ~ 1))
+# Joint test of 0
+a <- suppressWarnings(D1(model2, model3))$result
+
+a.p <- style_pvalue(a[4])
+```
+
+The p-value for the joint test that all coefficients are 0 is `r a.p`.
+**Table** \@ref(tab:step2impfup) shows all predictors again.
+
+<br>
+
+```{r imp-fup-step2b,  tab.cap = '(ref:step2impfup)', tab.id = "step2impfup", label = "step2impfup", tab.cap.style = "Table Caption", ft.align = "center"}
+tab2 <- pool(model2) %>% summary() %>% 
+  as_tibble() %>% 
+  mutate(term = case_when(term == "male" ~ "Male sex", 
+                          term == "age" ~ "Age",
+                          term == "plt_c100-199" ~ "Platelets 100-199", 
+                          term == "plt_c<100" ~ "Platelets <100")) %>% 
+  mutate(c.low = estimate - 1.96 * std.error, 
+         c.hi = estimate + 1.96 * std.error) %>% 
+  mutate(across(c(estimate, std.error, c.low, c.hi), ~mcomma(.x, 0.01)), 
+         p.value = style_pvalue(p.value, 2)) %>% 
+  mutate("95% CI" = glue("{c.low}, {c.hi}"))
+
+tab2 %>% 
+  select("Characteristic" = term, 
+         "log(HR)" = estimate, 
+         `95% CI`, 
+         "p-value" = p.value) %>% 
+  flextable() %>% 
+  theme_ft_surial() %>% 
+  align(j = c(2:4), align = "center", part = "all")
+
+
+imp_results2 <- imp_results2 %>% 
+  mutate(across(c(estimate, std.error, c.low, c.hi), ~mcomma(.x, 0.01)), 
+         p.value = style_pvalue(p.value, 2),
+         CI = glue("{c.low} to {c.hi}")) %>% 
+  bind_rows(tab2 %>% 
+              mutate(CI = glue("{c.low} to {c.hi}")) %>% 
+              select(-c(c.low, c.hi, `95% CI`))) %>% 
+  select(-c.low, -c.hi)
+```
+
+<br>
+
+##### Step 3
+
+```{r}
+# Extract c.statistics and std for all models
+d <- map_dfr(model$analyses, ~.x$concordance[c("concordance", "std")])
+
+# Pool c.statistics using rubins rules. I used logit transformation for c, but
+# not for std because I had errors
+
+hcc_full_fup <- d %>% 
+  summarise(median_c = median(concordance), 
+            min_c = min(concordance),
+            max_c = max(concordance)) %>% 
+  mutate_all(mcomma, 0.01) %>% 
+  mutate(term = "Harrell c-index")
+
+
+# pool <- d %>% 
+#   mutate(var = std^2) %>% 
+#   mutate_all(car::logit) %>% 
+#   summarise(pool = 1/params$n_imputations * (sum(concordance))) %>% 
+#   mutate_all(boot::inv.logit)
+# 
+# se_pool <- d %>% 
+#   mutate(var = std^2, 
+#          delta = (concordance - pull(pool))^2) %>%
+#   summarise(v_w = 1/nrow(.) * (sum(var)), 
+#             v_b = 1/(nrow(.) - 1) * sum(delta)) %>% 
+#   summarise(se_pooled = sqrt(v_w + v_b + (v_b / params$n_imputations)))
+# 
+# hcc_full_fup <- tibble(pool, se_pool) %>% 
+#   mutate(conf.low = pool - 1.96 * se_pooled, 
+#          conf.high = pool + 1.96 * se_pooled) %>% 
+#   rename(c_statistic = pool) %>% 
+#   mutate_all(mcomma, 0.001)
+
+imp_results2 <- imp_results2 %>% 
+  bind_rows(
+    hcc_full_fup %>% 
+      mutate(term = "Harrell c-index") %>% 
+      mutate(range = glue("{min_c} to {max_c}")) %>% 
+      select(term, estimate = median_c, range))
+
+```
+
+The pooled *c-statistic* for HCC prediction within the full follow-up
+was `r hcc_full_fup[1]` (range
+`r glue("{hcc_full_fup$min_c} to {hcc_full_fup$max_c}")`).
+
+<br>
+
+##### Step 4
+
+**Figure** \@ref(fig:imp-fup-step3) shows the same pattern for the full
+follow-up period.
+
+```{r imp-fup-step3, fig.cap = '(ref:kaplan-fup-imp)'}
+# Step 3: Kaplan meier Curves
+
+# Plot kaplan meier of imputation 1
+df_kaplan <- imp_long %>% 
+  filter(.imp == 1)
+
+S_kaplan <- survfit(Surv(time = time0, 
+                         time2 = time_y2, event = event2) ~ page_b_cat, df_kaplan) 
+pp <- ggsurvplot(S_kaplan, 
+           fun = "cumhaz", 
+           conf.int = FALSE, 
+           pval = FALSE, 
+           risk.table = FALSE, 
+           xlab = "Years since TFV start", 
+           ylab = "Cumulative hazard of HCC", 
+           legend.labs = c("Page-B ≤ 9", 
+                           "Page-B 10-17",
+                           "Page-B ≥ 18"), 
+           legend.title = "Page-B score", 
+           ylim = c(0, 0.15), 
+           censor = FALSE, 
+           ggtheme = theme_survminer(base_family = "Open Sans"))
+
+kaplan_15y_imp <- pp$plot + 
+  theme_kaplan(base_family = "Roboto") + 
+  scale_color_paletteer_d("colorblindr::OkabeIto") + 
+  labs(color = NULL)
+
+kaplan_15y_imp
+
+ggsave(here("graphs", "08d-kaplan_meyer_15y_imp_left_c.png"), 
+       dpi = 300, bg = "white", 
+       width = 6, height = 5)
+
+
+p_comp <- kaplan_15y_cc + 
+  labs(subtitle = "(**A**) Complete Case Dataset") 
+
+p_imp <- kaplan_15y_imp + 
+  labs(subtitle = "(**B**) Imputation Dataset")
+
+p_combined_h <- p_comp + p_imp & 
+  theme(plot.subtitle = ggtext::element_markdown(hjust = 0.5,
+                                                 color = "grey50"),
+        plot.margin = margin(r = 9, 
+                             l = 9, 
+                             b = 5, t = 5, unit = "mm"))
+
+
+p_combined_v <- p_comp / p_imp & 
+  theme(plot.subtitle = ggtext::element_markdown(hjust = 0.5,
+                                                 color = "grey50"), 
+        plot.margin = margin(r = 5, 
+                             l = 5, 
+                             b = 7.5, t = 7.5, unit = "mm"))
+
+  
+ggsave(plot = p_combined_h, 
+       filename = here("graphs", "08d-kaplan_combined_left_c.png"), 
+       dpi = 300, bg = "white", width = 10, height = 5)
+
+ggsave(plot = p_combined_h, 
+       filename = here("graphs", "08d-kaplan_combined_left_c.pdf"), 
+       dpi = 300, bg = "white", width = 10, height = 5, 
+       device = cairo_pdf)
+
+ggsave(plot = p_combined_v, 
+       filename = here("graphs", "08d-kaplan_combined_v_left_c.png"), 
+       dpi = 300, bg = "white", width = 8, height = 10)
+
+ggsave(plot = p_combined_v, 
+       filename = here("graphs", "08d-kaplan_combined_v_left_c.pdf"), 
+       dpi = 300, bg = "white", width = 8, height = 10, 
+       device = cairo_pdf)
+```
+
+<br>
+
+\newpage
+
+## Summary
+
+<br>
+
+```{r n-hcc-stratified, tab.cap = '(ref:hcc-stratified)', tab.id = "hcc-stratified", label = "hcc-stratified", tab.cap.style = "Table Caption", ft.align = "center"}
+x <- summary(S_kaplan, times = c(1, 2, 3, 5, 10, 15))
+
+tibble(page_b_cat = x$strata, 
+       time = x[["time"]], 
+       n.event = x[["n.event"]], 
+       n.risk = x[["n.risk"]],
+       cum_hazard = x[]$cumhaz * 100) %>% 
+  group_by(page_b_cat) %>% 
+  mutate(n.event = cumsum(n.event)) %>% 
+  mutate(page_b_cat = str_remove(page_b_cat, "page_b_cat=")) %>% 
+  mutate(cum_hazard = glue("{mcomma(cum_hazard, 0.1)}%")) %>% 
+  flextable() %>% 
+  set_header_labels(page_b_cat = "Page B Category",
+                    time = "Years since TFV", 
+                    n.event = "Cumulative N of HCCs", 
+                    n.risk = "N at risk", 
+                    cum_hazard = "Cumulative Hazard") %>% 
+  theme_ft_surial() %>% 
+  autofit() %>% 
+  flextable::colformat_num(big.mark = "") %>% 
+  width(j = 1, width = 1) %>% 
+  width(j = 2:5, width = 0.8) %>% 
+  align(j = 2:5, align = "center", part = "all") %>% 
+  hline(i = c(6, 12), border = big_border)
+```
+
+
+```{r n-hcc-stratified-cc, tab.cap = '(ref:hcc-stratified-cc)', tab.id = "hcc-stratified-cc", label = "hcc-stratified-cc", tab.cap.style = "Table Caption", ft.align = "center"}
+x_comp <- survfit(Surv(time = time0, time2 = time_y2, event = event2) ~ page_b_cat, 
+                  time_sub) %>% 
+  summary(times = c(1, 2, 3, 5, 10, 15))
+
+
+tibble(page_b_cat = x_comp$strata, 
+       time = x_comp[["time"]], 
+       n.event = x_comp[["n.event"]], 
+       n.risk = x_comp[["n.risk"]],
+       cum_hazard = x_comp[]$cumhaz * 100) %>% 
+  group_by(page_b_cat) %>% 
+  mutate(n.event = cumsum(n.event)) %>% 
+  mutate(page_b_cat = str_remove(page_b_cat, "page_b_cat=")) %>% 
+  mutate(cum_hazard = glue("{mcomma(cum_hazard, 0.1)}%")) %>% 
+  flextable() %>% 
+  set_header_labels(page_b_cat = "Page B Category",
+                    time = "Years since TFV", 
+                    n.event = "Cumulative N of HCCs", 
+                    n.risk = "N at risk", 
+                    cum_hazard = "Cumulative Hazard") %>% 
+  theme_ft_surial() %>% 
+  autofit() %>% 
+  flextable::colformat_num(big.mark = "") %>% 
+  width(j = 1, width = 1) %>% 
+  width(j = 2:5, width = 0.8) %>% 
+  align(j = 2:5, align = "center", part = "all") %>% 
+  hline(i = c(6, 12), border = big_border)
+```
+
+\newpage
+
+**Table** \@ref(tab:finalres) shows the summary of all estimates.
+
+```{r final-results,  tab.cap = '(ref:finalres)', tab.id = "finalres", label = "finalres", tab.cap.style = "Table Caption", ft.align = "center"}
+all_results <- bind_rows(
+  comp_result %>% mutate(model = "Complete case analysis, 15 year risk"),
+  imp_results1 %>% mutate(model = "Imputation, 5 year risk"),
+  imp_results2 %>% mutate(model = "Imputation, risk in full follow-up")
+) %>% 
+  select(model, term, everything()) %>% 
+  mutate(term = case_when(term == "male" ~ "Male sex", 
+                          term == "age" ~ "Age",
+                          term == "plt_c100-199" ~ "Platelets 100-199", 
+                          term == "plt_c<100" ~ "Platelets <100", 
+                          TRUE ~ term)) %>% 
+  mutate(term = factor(term, levels = c("LP", "Harrell c-index", 
+                                        "Male sex", "Age", "Platelets 100-199", 
+                                        "Platelets <100"))) %>% 
+  arrange(model, term) %>% 
+  select(-statistic, -df, -conf.low, -conf.high)
+
+all_results %>% 
+  rename("95% CI" = CI) %>% 
+  flextable() %>% 
+  set_header_labels(std.error = "SE", 
+                    p.value = "P") %>% 
+  merge_v(j = "model") %>% 
+  autofit() %>% 
+  theme_ft_surial() %>%
+  fix_border_issues() %>% 
+  valign(j = 1, valign = "top") %>% 
+  hline(i = c(6, 12), part = "body", border = big_border) %>% 
+  align(j = 3:6, align = "center", part = "all") %>% 
+  autofit() %>%
+  width(j = 1, width = 1.5) %>% 
+  width(j = 2, width = 1.2) %>% 
+  width(j = c(3, 4, 5), 0.8) %>% 
+  width(j = 6, 0.95)
+```
+
+```{r}
+# WIP: get R2 and Dxy from RMS package
+imp_list <- imp_long %>% 
+  filter(.imp != 0) %>% 
+  group_split(.imp)
+
+
+extract_indices <- function(df){
+  S <- Surv(event = df$event2, 
+            time = df$time_y2)
+  m <- rms::cph(S ~ LP, data = df)
+  stats <- m$stats
+  values <- c(stats["R2"], stats["Dxy"], stats["Dxy"]/2 + 0.5)
+  setNames(values, nm = c("R2", "Dxy", "c"))
+}
+
+rms_list <- map_dfr(imp_list, extract_indices)
+
+# Needs pooling
+```
+
+
+```{r write-out}
+write_rds(time_sub, here("processed", "08d-studypop_sens_left_c.rds"))
+write_rds(imp_long, here("processed", "08d-imp_long_df_sens_left_c.rds"))
+```
+
+
+<!-- Table captions -->
+
+(ref:tab1) Patient characteristics at tenofovir start, stratified by cohort.
+
+(ref:step2comp) Regression model results, includes linear predictor as offset.
+
+(ref:step2imp) Regression model results with the linear predictor as offset (imputation analysis).
+
+(ref:step2impfup) Regression model results with the linear predictor as offset, now for full follow-up (imputation analysis).
+
+(ref:hcc-stratified) Life table of hepatocellular carcinomas (HCC) after start of Tenofovir (imputation data).
+
+(ref:hcc-stratified-cc) Life table of hepatocellular carcinomas (HCC) after start of Tenofovir (complete cases).
+
+(ref:finalres) Summary of all estimates for the different steps.
+
+<!-- Figure captions -->
+
+(ref:kaplan5ycomplete) Kaplan Meier curve for the development of HCC within 5 years (no imputation).
+
+(ref:papa) Kaplan Meier curves from the original publication by Papatheodoridis et al.
+
+(ref:impute) Density plot of imputed (red lines) and original values.
+
+(ref:kaplan5yimp) Kaplan Meier curve for the development of HCC within 5 years (with imputation).
+
+(ref:kaplan-fup-imp) Kaplan Meier curve for the development of HCC within the full follow-up period (with imputation).
+
+\newpage
+
+# References
+
+::: {#refs}
+:::
